@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -196,8 +197,11 @@ static void render(struct display_output *output) {
     if (output->state->span_outputs && combined_bounds.valid) {
         // Spanning mode: render video at combined resolution and offset appropriately
         // Calculate this output's position relative to the combined bounds
-        int32_t rel_x = (output->x * output->scale) - combined_bounds.x_min;
-        int32_t rel_y = (output->y * output->scale) - combined_bounds.y_min;
+        // Use int64_t to avoid potential overflow with large coordinates/scales
+        int64_t scaled_x = (int64_t)output->x * output->scale;
+        int64_t scaled_y = (int64_t)output->y * output->scale;
+        int32_t rel_x = (int32_t)(scaled_x - combined_bounds.x_min);
+        int32_t rel_y = (int32_t)(scaled_y - combined_bounds.y_min);
         
         // Set up viewport to render the correct portion of the spanning video
         // The viewport positions the rendering such that only the portion for this output is visible
