@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,7 @@ struct wl_state {
     struct wl_list outputs; // struct display_output::link
     char *monitor; // User selected output
     int surface_layer;
+    bool span_outputs; // Span video across multiple outputs
 };
 
 struct display_output {
@@ -49,6 +51,7 @@ struct display_output {
 
     uint32_t width, height;
     uint32_t scale;
+    int32_t x, y; // Position of output for spanning mode
 
     struct wl_list link;
 
@@ -139,29 +142,112 @@ static void handle_signal(int signum) {
 
 const static struct wl_callback_listener wl_surface_frame_listener;
 
-static void render(struct display_output *output) {
-    mpv_render_param render_params[] = {
-        {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
-            .fbo = 0,
-            .w = output->width * output->scale,
-            .h = output->height * output->scale,
-        }},
-        // Flip rendering (needed due to flipped GL coordinate system).
-        {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
-        // Do not wait for a fresh frame to render
-        {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
-        {MPV_RENDER_PARAM_INVALID, NULL},
-    };
+// Structure to hold combined bounds for spanning mode
+static struct {
+    int32_t x_min, y_min;
+    int32_t x_max, y_max;
+    uint32_t width, height;
+    bool valid;
+} combined_bounds = {0, 0, 0, 0, 0, 0, false};
 
+// Calculate combined bounds of all active outputs for spanning mode
+static void calculate_combined_bounds(struct wl_state *state) {
+    combined_bounds.valid = false;
+    combined_bounds.x_min = INT32_MAX;
+    combined_bounds.y_min = INT32_MAX;
+    combined_bounds.x_max = INT32_MIN;
+    combined_bounds.y_max = INT32_MIN;
+
+    struct display_output *output;
+    wl_list_for_each(output, &state->outputs, link) {
+        if (output->layer_surface) {
+            if (output->x < combined_bounds.x_min)
+                combined_bounds.x_min = output->x;
+            if (output->y < combined_bounds.y_min)
+                combined_bounds.y_min = output->y;
+            if (output->x + (int32_t)(output->width * output->scale) > combined_bounds.x_max)
+                combined_bounds.x_max = output->x + (int32_t)(output->width * output->scale);
+            if (output->y + (int32_t)(output->height * output->scale) > combined_bounds.y_max)
+                combined_bounds.y_max = output->y + (int32_t)(output->height * output->scale);
+            combined_bounds.valid = true;
+        }
+    }
+
+    if (combined_bounds.valid) {
+        combined_bounds.width = combined_bounds.x_max - combined_bounds.x_min;
+        combined_bounds.height = combined_bounds.y_max - combined_bounds.y_min;
+        if (VERBOSE)
+            cflp_info("Combined bounds: %dx%d at (%d, %d)", 
+                combined_bounds.width, combined_bounds.height,
+                combined_bounds.x_min, combined_bounds.y_min);
+    }
+}
+
+static void render(struct display_output *output) {
+    int output_w = output->width * output->scale;
+    int output_h = output->height * output->scale;
+    
     if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context))
         cflp_error("Failed to make output surface current %s", eglGetErrorString(eglGetError()));
 
-    glViewport(0, 0, output->width * output->scale, output->height * output->scale);
+    // Clear the output surface
+    glViewport(0, 0, output_w, output_h);
 
-    // Render frame
-    int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
-    if (mpv_err < 0)
-        cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+    if (output->state->span_outputs && combined_bounds.valid) {
+        // Spanning mode: render video at combined resolution and offset appropriately
+        // Calculate this output's position relative to the combined bounds
+        int32_t rel_x = (output->x * output->scale) - combined_bounds.x_min;
+        int32_t rel_y = (output->y * output->scale) - combined_bounds.y_min;
+        
+        // Set up viewport to render the correct portion of the spanning video
+        // The viewport positions the rendering such that only the portion for this output is visible
+        // We need to render at the full combined size but offset so this output shows its portion
+        glViewport(-rel_x, -(combined_bounds.height - output_h - rel_y), 
+                   combined_bounds.width, combined_bounds.height);
+        
+        // Enable scissor to clip to this output's area
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, output_w, output_h);
+        
+        mpv_render_param render_params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
+                .fbo = 0,
+                .w = combined_bounds.width,
+                .h = combined_bounds.height,
+            }},
+            // Flip rendering (needed due to flipped GL coordinate system).
+            {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
+            // Do not wait for a fresh frame to render
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
+            {MPV_RENDER_PARAM_INVALID, NULL},
+        };
+        
+        // Render frame
+        int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
+        if (mpv_err < 0)
+            cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+        
+        glDisable(GL_SCISSOR_TEST);
+    } else {
+        // Normal mode: render video to fit this output
+        mpv_render_param render_params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
+                .fbo = 0,
+                .w = output_w,
+                .h = output_h,
+            }},
+            // Flip rendering (needed due to flipped GL coordinate system).
+            {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
+            // Do not wait for a fresh frame to render
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
+            {MPV_RENDER_PARAM_INVALID, NULL},
+        };
+        
+        // Render frame
+        int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
+        if (mpv_err < 0)
+            cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+    }
 
     // Callback new frame
     output->frame_callback = wl_surface_frame(output->surface);
@@ -717,7 +803,17 @@ static void create_layer_surface(struct display_output *output) {
 
 static void output_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y, int32_t physical_width,
         int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
-    // NOP
+    (void)wl_output;
+    (void)physical_width;
+    (void)physical_height;
+    (void)subpixel;
+    (void)make;
+    (void)model;
+    (void)transform;
+
+    struct display_output *output = data;
+    output->x = x;
+    output->y = y;
 }
 
 static void output_mode(void *data, struct wl_output *wl_output, uint32_t flags, int32_t width, int32_t height,
@@ -916,6 +1012,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         {"fork", no_argument, NULL, 'f'},
         {"auto-pause", no_argument, NULL, 'p'},
         {"auto-stop", no_argument, NULL, 's'},
+        {"span", no_argument, NULL, 'm'},
         {"slideshow", required_argument, NULL, 'n'},
         {"layer", required_argument, NULL, 'l'},
         {"mpv-options", required_argument, NULL, 'o'},
@@ -936,6 +1033,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         "                               This saves CPU usage, more or less, seamlessly\n"
         "--auto-stop    -s              Automagically* stop mpv when the wallpaper is hidden\n"
         "                               This saves CPU/RAM usage, although more abruptly\n"
+        "--span         -m              Span video across multiple outputs as one surface\n"
         "--slideshow    -n SECS         Slideshow mode plays the next video in a playlist every ? seconds\n"
         "                               And passes mpv options \"loop loop-playlist\" for convenience\n"
         "--layer        -l LAYER        Specifies shell surface layer to run on (background by default)\n"
@@ -947,7 +1045,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
     char *layer_name;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hdvfpsn:l:o:Z:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hdvfpsmn:l:o:Z:", long_options, NULL)) != -1) {
 
         switch (opt) {
             case 'h':
@@ -983,6 +1081,9 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
                     cflp_warning("You cannot use auto-pause and auto-stop together");
                     halt_info.auto_pause = 0;
                 }
+                break;
+            case 'm':
+                state->span_outputs = true;
                 break;
             case 'n':
                 SLIDESHOW_TIME = atoi(optarg);
@@ -1130,6 +1231,14 @@ int main(int argc, char **argv) {
     if (wl_list_empty(&state.outputs)) {
         cflp_error(":/ sorry about this but we can't seem to find any output.");
         return EXIT_FAILURE;
+    }
+
+    // Calculate combined bounds for spanning mode
+    if (state.span_outputs) {
+        calculate_combined_bounds(&state);
+        if (!combined_bounds.valid) {
+            cflp_warning("No outputs available for spanning mode");
+        }
     }
 
     // Main Loop

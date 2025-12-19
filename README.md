@@ -23,6 +23,17 @@ ninja -C build
 # Install
 ninja -C build install
 ```
+
+### Nix Development Shell
+If you use Nix with flakes, you can enter a development environment with all dependencies:
+```
+nix develop
+```
+Or with direnv, simply `cd` into the directory and allow the `.envrc`:
+```
+direnv allow
+```
+
 ## Usage
 Simple example:
 ```
@@ -31,6 +42,11 @@ mpvpaper DP-2 /path/to/video
 To play the same video on all outputs:
 ```
 mpvpaper ALL /path/to/video
+```
+To span a video across multiple monitors as one surface:
+```
+mpvpaper -m 'DP-1 DP-2' /path/to/video
+mpvpaper --span ALL /path/to/video
 ```
 You can also forward mpv options by passing "--mpv-options" or "-o" like so:
 ```
