@@ -1,10 +1,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +35,7 @@ struct wl_state {
     struct wl_list outputs; // struct display_output::link
     char *monitor; // User selected output
     int surface_layer;
+    bool span_outputs; // Span video across multiple outputs
 };
 
 struct display_output {
@@ -49,6 +52,7 @@ struct display_output {
 
     uint32_t width, height;
     uint32_t scale;
+    int32_t x, y; // Position of output for spanning mode
 
     struct wl_list link;
 
@@ -59,6 +63,12 @@ struct display_output {
 static EGLConfig egl_config;
 static EGLDisplay *egl_display;
 static EGLContext *egl_context;
+
+// Offscreen FBO for spanning mode
+static GLuint spanning_fbo = 0;
+static GLuint spanning_texture = 0;
+static uint32_t spanning_fbo_width = 0;
+static uint32_t spanning_fbo_height = 0;
 
 static mpv_handle *mpv;
 static mpv_render_context *mpv_glcontext;
@@ -89,6 +99,9 @@ static uint SLIDESHOW_TIME = 0;
 static bool SHOW_OUTPUTS = false;
 static int VERBOSE = 0;
 
+// Forward declaration
+static void cleanup_spanning_fbo();
+
 static void exit_cleanup() {
 
     // Give mpv a chance to finish
@@ -110,6 +123,9 @@ static void exit_cleanup() {
         mpv_render_context_free(mpv_glcontext);
     if (mpv)
         mpv_terminate_destroy(mpv);
+
+    // Cleanup spanning FBO if it exists
+    cleanup_spanning_fbo();
 
     if (egl_context)
         eglDestroyContext(egl_display, egl_context);
@@ -139,29 +155,211 @@ static void handle_signal(int signum) {
 
 const static struct wl_callback_listener wl_surface_frame_listener;
 
-static void render(struct display_output *output) {
-    mpv_render_param render_params[] = {
-        {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
-            .fbo = 0,
-            .w = output->width * output->scale,
-            .h = output->height * output->scale,
-        }},
-        // Flip rendering (needed due to flipped GL coordinate system).
-        {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
-        // Do not wait for a fresh frame to render
-        {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
-        {MPV_RENDER_PARAM_INVALID, NULL},
-    };
+// Structure to hold combined bounds for spanning mode
+static struct {
+    int32_t x_min, y_min;
+    int32_t x_max, y_max;
+    uint32_t width, height;
+    bool valid;
+    bool needs_recalc; // Flag to indicate bounds need recalculation
+} combined_bounds = {0, 0, 0, 0, 0, 0, false, true};
 
+// Calculate combined bounds of all active outputs for spanning mode
+static void calculate_combined_bounds(struct wl_state *state) {
+    combined_bounds.valid = false;
+    combined_bounds.x_min = INT32_MAX;
+    combined_bounds.y_min = INT32_MAX;
+    combined_bounds.x_max = INT32_MIN;
+    combined_bounds.y_max = INT32_MIN;
+
+    struct display_output *output;
+    wl_list_for_each(output, &state->outputs, link) {
+        if (output->layer_surface) {
+            if (VERBOSE)
+                cflp_info("Output %s: position (%d, %d), size %dx%d, scale %d", 
+                    output->name, output->x, output->y, 
+                    output->width, output->height, output->scale);
+            if (output->x < combined_bounds.x_min)
+                combined_bounds.x_min = output->x;
+            if (output->y < combined_bounds.y_min)
+                combined_bounds.y_min = output->y;
+            if (output->x + (int32_t)(output->width * output->scale) > combined_bounds.x_max)
+                combined_bounds.x_max = output->x + (int32_t)(output->width * output->scale);
+            if (output->y + (int32_t)(output->height * output->scale) > combined_bounds.y_max)
+                combined_bounds.y_max = output->y + (int32_t)(output->height * output->scale);
+            combined_bounds.valid = true;
+        }
+    }
+
+    if (combined_bounds.valid) {
+        combined_bounds.width = combined_bounds.x_max - combined_bounds.x_min;
+        combined_bounds.height = combined_bounds.y_max - combined_bounds.y_min;
+        if (VERBOSE)
+            cflp_info("Combined bounds: %dx%d at (%d, %d)", 
+                combined_bounds.width, combined_bounds.height,
+                combined_bounds.x_min, combined_bounds.y_min);
+    }
+    combined_bounds.needs_recalc = false; // Clear the flag after calculation
+}
+
+// Create or resize the offscreen FBO for spanning mode
+static void ensure_spanning_fbo(uint32_t width, uint32_t height) {
+    if (spanning_fbo != 0 && spanning_fbo_width == width && spanning_fbo_height == height) {
+        return; // FBO already exists with correct size
+    }
+    
+    // Clean up old FBO if it exists
+    if (spanning_fbo != 0) {
+        glDeleteFramebuffers(1, &spanning_fbo);
+        glDeleteTextures(1, &spanning_texture);
+        spanning_fbo = 0;
+        spanning_texture = 0;
+    }
+    
+    // Create texture for the FBO
+    glGenTextures(1, &spanning_texture);
+    glBindTexture(GL_TEXTURE_2D, spanning_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Create FBO and attach texture
+    glGenFramebuffers(1, &spanning_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, spanning_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, spanning_texture, 0);
+    
+    // Check FBO completeness
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        cflp_error("Spanning FBO is incomplete: 0x%X", status);
+        glDeleteFramebuffers(1, &spanning_fbo);
+        glDeleteTextures(1, &spanning_texture);
+        spanning_fbo = 0;
+        spanning_texture = 0;
+        return;
+    }
+    
+    // Unbind FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    
+    spanning_fbo_width = width;
+    spanning_fbo_height = height;
+    
+    if (VERBOSE)
+        cflp_info("Created spanning FBO: %dx%d", width, height);
+}
+
+static void cleanup_spanning_fbo() {
+    if (spanning_fbo != 0) {
+        glDeleteFramebuffers(1, &spanning_fbo);
+        glDeleteTextures(1, &spanning_texture);
+        spanning_fbo = 0;
+        spanning_texture = 0;
+        spanning_fbo_width = 0;
+        spanning_fbo_height = 0;
+    }
+}
+
+static void render(struct display_output *output) {
+    int output_w = output->width * output->scale;
+    int output_h = output->height * output->scale;
+    
     if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context))
         cflp_error("Failed to make output surface current %s", eglGetErrorString(eglGetError()));
 
-    glViewport(0, 0, output->width * output->scale, output->height * output->scale);
+    // Clear the output surface
+    glViewport(0, 0, output_w, output_h);
 
-    // Render frame
-    int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
-    if (mpv_err < 0)
-        cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+    // Recalculate combined bounds if needed in spanning mode
+    if (output->state->span_outputs && combined_bounds.needs_recalc) {
+        calculate_combined_bounds(output->state);
+    }
+
+    if (output->state->span_outputs && combined_bounds.valid) {
+        // Spanning mode: render to offscreen FBO, then blit to this output
+        // Calculate this output's position relative to the combined bounds
+        int64_t scaled_x = (int64_t)output->x * output->scale;
+        int64_t scaled_y = (int64_t)output->y * output->scale;
+        int32_t rel_x = (int32_t)(scaled_x - combined_bounds.x_min);
+        int32_t rel_y = (int32_t)(scaled_y - combined_bounds.y_min);
+        
+        if (VERBOSE == 2)
+            cflp_info("Rendering %s: output pos (%d,%d), rel pos (%d,%d)", 
+                output->name, output->x, output->y, rel_x, rel_y);
+        
+        // Ensure we have a properly sized offscreen FBO
+        ensure_spanning_fbo(combined_bounds.width, combined_bounds.height);
+        
+        if (spanning_fbo == 0) {
+            cflp_error("Failed to create spanning FBO");
+            return;
+        }
+        
+        // Render to the offscreen FBO
+        glBindFramebuffer(GL_FRAMEBUFFER, spanning_fbo);
+        glViewport(0, 0, combined_bounds.width, combined_bounds.height);
+        glClear(GL_COLOR_BUFFER_BIT);
+        
+        mpv_render_param render_params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
+                .fbo = spanning_fbo,
+                .w = combined_bounds.width,
+                .h = combined_bounds.height,
+            }},
+            // Flip rendering (needed due to flipped GL coordinate system).
+            {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
+            // Do not wait for a fresh frame to render
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
+            {MPV_RENDER_PARAM_INVALID, NULL},
+        };
+        
+        // Render frame to offscreen FBO
+        int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
+        if (mpv_err < 0)
+            cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+        
+        // Now blit the appropriate portion from the offscreen FBO to the output surface
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, spanning_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        
+        // Calculate source rectangle (portion of the offscreen FBO to read)
+        // OpenGL Y coordinates are bottom-up, so we need to flip
+        int src_x = rel_x;
+        int src_y = combined_bounds.height - rel_y - output_h;
+        int src_w = output_w;
+        int src_h = output_h;
+        
+        // Blit from offscreen FBO to the output surface
+        glBlitFramebuffer(
+            src_x, src_y, src_x + src_w, src_y + src_h,  // Source rectangle
+            0, 0, output_w, output_h,                      // Destination rectangle
+            GL_COLOR_BUFFER_BIT, GL_LINEAR
+        );
+        
+        // Unbind framebuffers
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    } else {
+        // Normal mode: render video to fit this output
+        mpv_render_param render_params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
+                .fbo = 0,
+                .w = output_w,
+                .h = output_h,
+            }},
+            // Flip rendering (needed due to flipped GL coordinate system).
+            {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
+            // Do not wait for a fresh frame to render
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
+            {MPV_RENDER_PARAM_INVALID, NULL},
+        };
+        
+        // Render frame
+        int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
+        if (mpv_err < 0)
+            cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+    }
 
     // Callback new frame
     output->frame_callback = wl_surface_frame(output->surface);
@@ -650,6 +848,11 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *su
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     wl_surface_set_buffer_scale(output->surface, output->scale);
 
+    // Mark that combined bounds need recalculation when in spanning mode
+    if (output->state->span_outputs) {
+        combined_bounds.needs_recalc = true;
+    }
+
     if (!output->egl_window) {
         output->egl_window = wl_egl_window_create(output->surface, output->width * output->scale,
                 output->height * output->scale);
@@ -717,7 +920,17 @@ static void create_layer_surface(struct display_output *output) {
 
 static void output_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y, int32_t physical_width,
         int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
-    // NOP
+    (void)wl_output;
+    (void)physical_width;
+    (void)physical_height;
+    (void)subpixel;
+    (void)make;
+    (void)model;
+    (void)transform;
+
+    struct display_output *output = data;
+    output->x = x;
+    output->y = y;
 }
 
 static void output_mode(void *data, struct wl_output *wl_output, uint32_t flags, int32_t width, int32_t height,
@@ -916,6 +1129,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         {"fork", no_argument, NULL, 'f'},
         {"auto-pause", no_argument, NULL, 'p'},
         {"auto-stop", no_argument, NULL, 's'},
+        {"span", no_argument, NULL, 'm'},
         {"slideshow", required_argument, NULL, 'n'},
         {"layer", required_argument, NULL, 'l'},
         {"mpv-options", required_argument, NULL, 'o'},
@@ -936,6 +1150,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         "                               This saves CPU usage, more or less, seamlessly\n"
         "--auto-stop    -s              Automagically* stop mpv when the wallpaper is hidden\n"
         "                               This saves CPU/RAM usage, although more abruptly\n"
+        "--span         -m              Span video across multiple outputs as one surface\n"
         "--slideshow    -n SECS         Slideshow mode plays the next video in a playlist every ? seconds\n"
         "                               And passes mpv options \"loop loop-playlist\" for convenience\n"
         "--layer        -l LAYER        Specifies shell surface layer to run on (background by default)\n"
@@ -947,7 +1162,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
     char *layer_name;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hdvfpsn:l:o:Z:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hdvfpsmn:l:o:Z:", long_options, NULL)) != -1) {
 
         switch (opt) {
             case 'h':
@@ -983,6 +1198,9 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
                     cflp_warning("You cannot use auto-pause and auto-stop together");
                     halt_info.auto_pause = 0;
                 }
+                break;
+            case 'm':
+                state->span_outputs = true;
                 break;
             case 'n':
                 SLIDESHOW_TIME = atoi(optarg);

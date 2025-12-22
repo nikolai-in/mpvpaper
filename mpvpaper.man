@@ -33,6 +33,13 @@ Automagically stop mpv when the wallpaper is hidden*
 
 This saves CPU/RAM usage, although more abruptly
 .TP
+\fB\-m\fR, \fB\-\-span\fR
+Span the video across multiple outputs as a single surface.
+
+When this option is used with multiple outputs (e.g., 'DP-1 DP-2' or 'ALL'),
+the video will be rendered as if all selected monitors were one large display.
+Each monitor shows a portion of the video based on its position.
+.TP
 \fB\-n\fR, \fB\-\-slideshow\fR <seconds>
 Slideshow mode plays the next video in a playlist every \fI\<seconds>\fR
 
@@ -63,6 +70,14 @@ mpvpaper 'Acer Technologies Acer H236HL LX1AA12341234' /path/to/video
 To play the same video on all outputs:
 .RS
 mpvpaper ALL /path/to/video
+.RE
+
+To span a video across multiple monitors as one surface:
+.RS
+mpvpaper -m 'DP-1 DP-2' /path/to/video
+.RE
+.RS
+mpvpaper --span ALL /path/to/video
 .RE
 
 Forward mpv options by passing "--mpv-options" or "-o" like so:
