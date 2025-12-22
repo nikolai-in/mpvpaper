@@ -194,6 +194,11 @@ static void render(struct display_output *output) {
     // Clear the output surface
     glViewport(0, 0, output_w, output_h);
 
+    // Recalculate combined bounds if in spanning mode before rendering
+    if (output->state->span_outputs) {
+        calculate_combined_bounds(output->state);
+    }
+
     if (output->state->span_outputs && combined_bounds.valid) {
         // Spanning mode: render video at combined resolution and offset appropriately
         // Calculate this output's position relative to the combined bounds
@@ -739,11 +744,6 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *su
     output->height = height;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     wl_surface_set_buffer_scale(output->surface, output->scale);
-
-    // Recalculate combined bounds if in spanning mode
-    if (output->state->span_outputs) {
-        calculate_combined_bounds(output->state);
-    }
 
     if (!output->egl_window) {
         output->egl_window = wl_egl_window_create(output->surface, output->width * output->scale,
