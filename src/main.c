@@ -232,8 +232,8 @@ static void render(struct display_output *output) {
         mpv_render_param render_params[] = {
             {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
                 .fbo = 0,
-                .w = output_w,
-                .h = output_h,
+                .w = combined_bounds.width,
+                .h = combined_bounds.height,
             }},
             // Flip rendering (needed due to flipped GL coordinate system).
             {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
