@@ -149,7 +149,8 @@ static struct {
     int32_t x_max, y_max;
     uint32_t width, height;
     bool valid;
-} combined_bounds = {0, 0, 0, 0, 0, 0, false};
+    bool needs_recalc; // Flag to indicate bounds need recalculation
+} combined_bounds = {0, 0, 0, 0, 0, 0, false, true};
 
 // Calculate combined bounds of all active outputs for spanning mode
 static void calculate_combined_bounds(struct wl_state *state) {
@@ -182,6 +183,7 @@ static void calculate_combined_bounds(struct wl_state *state) {
                 combined_bounds.width, combined_bounds.height,
                 combined_bounds.x_min, combined_bounds.y_min);
     }
+    combined_bounds.needs_recalc = false; // Clear the flag after calculation
 }
 
 static void render(struct display_output *output) {
@@ -194,8 +196,8 @@ static void render(struct display_output *output) {
     // Clear the output surface
     glViewport(0, 0, output_w, output_h);
 
-    // Recalculate combined bounds if in spanning mode before rendering
-    if (output->state->span_outputs) {
+    // Recalculate combined bounds if needed in spanning mode
+    if (output->state->span_outputs && combined_bounds.needs_recalc) {
         calculate_combined_bounds(output->state);
     }
 
@@ -744,6 +746,11 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *su
     output->height = height;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     wl_surface_set_buffer_scale(output->surface, output->scale);
+
+    // Mark that combined bounds need recalculation when in spanning mode
+    if (output->state->span_outputs) {
+        combined_bounds.needs_recalc = true;
+    }
 
     if (!output->egl_window) {
         output->egl_window = wl_egl_window_create(output->surface, output->width * output->scale,
