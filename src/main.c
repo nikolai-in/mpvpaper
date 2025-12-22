@@ -740,6 +740,11 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *su
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     wl_surface_set_buffer_scale(output->surface, output->scale);
 
+    // Recalculate combined bounds if in spanning mode
+    if (output->state->span_outputs) {
+        calculate_combined_bounds(output->state);
+    }
+
     if (!output->egl_window) {
         output->egl_window = wl_egl_window_create(output->surface, output->width * output->scale,
                 output->height * output->scale);
@@ -1235,14 +1240,6 @@ int main(int argc, char **argv) {
     if (wl_list_empty(&state.outputs)) {
         cflp_error(":/ sorry about this but we can't seem to find any output.");
         return EXIT_FAILURE;
-    }
-
-    // Calculate combined bounds for spanning mode
-    if (state.span_outputs) {
-        calculate_combined_bounds(&state);
-        if (!combined_bounds.valid) {
-            cflp_warning("No outputs available for spanning mode");
-        }
     }
 
     // Main Loop
