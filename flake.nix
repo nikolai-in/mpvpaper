@@ -6,13 +6,19 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-      in
-      {
-        packages.default = pkgs.stdenv.mkDerivation {
+
+        # Build the package once and expose it under multiple names.
+        pkg = pkgs.stdenv.mkDerivation {
           pname = "mpvpaper";
           version = "1.8";
 
@@ -41,15 +47,22 @@
             mainProgram = "mpvpaper";
           };
         };
+      in
+      {
+        # Expose the primary package under both `mpvpaper` and `default`.
+        packages = {
+          mpvpaper = pkg;
+          default = pkg;
+        };
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${system}.default ];
+          inputsFrom = [ self.packages.${system}.mpvpaper ];
 
           packages = with pkgs; [
             # Development tools
             gdb
             valgrind
-            clang-tools  # For clangd LSP
+            clang-tools # For clangd LSP
 
             # Build tools already included via inputsFrom
           ];
