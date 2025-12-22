@@ -99,6 +99,9 @@ static uint SLIDESHOW_TIME = 0;
 static bool SHOW_OUTPUTS = false;
 static int VERBOSE = 0;
 
+// Forward declaration
+static void cleanup_spanning_fbo();
+
 static void exit_cleanup() {
 
     // Give mpv a chance to finish
