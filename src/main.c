@@ -163,6 +163,10 @@ static void calculate_combined_bounds(struct wl_state *state) {
     struct display_output *output;
     wl_list_for_each(output, &state->outputs, link) {
         if (output->layer_surface) {
+            if (VERBOSE)
+                cflp_info("Output %s: position (%d, %d), size %dx%d, scale %d", 
+                    output->name, output->x, output->y, 
+                    output->width, output->height, output->scale);
             if (output->x < combined_bounds.x_min)
                 combined_bounds.x_min = output->x;
             if (output->y < combined_bounds.y_min)
@@ -209,6 +213,11 @@ static void render(struct display_output *output) {
         int64_t scaled_y = (int64_t)output->y * output->scale;
         int32_t rel_x = (int32_t)(scaled_x - combined_bounds.x_min);
         int32_t rel_y = (int32_t)(scaled_y - combined_bounds.y_min);
+        
+        if (VERBOSE == 2)
+            cflp_info("Rendering %s: output pos (%d,%d), rel pos (%d,%d), viewport offset (%d,%d)", 
+                output->name, output->x, output->y, rel_x, rel_y,
+                -rel_x, -(combined_bounds.height - output_h - rel_y));
         
         // Set up viewport to render the correct portion of the spanning video
         // The viewport positions the rendering such that only the portion for this output is visible
